@@ -5,18 +5,38 @@
 
 #include "secrets.h"
 
-// Teste focado em banco de dados:
-// 1. conecta no Wi-Fi
-// 2. sincroniza horario por NTP
-// 3. envia leituras mockadas para o Realtime Database
+/*
+  Teste focado em banco de dados:
+  1. conecta no Wi-Fi;
+  2. sincroniza horario por NTP;
+  3. usa uma task para ler dados mockados;
+  4. usa outra task para enviar os dados ao Firestore.
+*/
 
+// Identificadores fixos usados nos documentos enviados para o Firestore.
 const char *userId = "usuario1";
 const char *roomId = "sala";
 
+// Intervalo entre leituras automaticas.
 const unsigned long SEND_INTERVAL_MS = 30000;
 
-unsigned long lastSendMs = 0;
+const uint8_t READING_QUEUE_SIZE = 5;
 
+struct ReadingData {
+  unsigned long epoch;
+  unsigned long secondsOn;
+  unsigned long presenceCount;
+  float energyKwh;
+  float estimatedCostBrl;
+};
+
+QueueHandle_t readingQueue = nullptr;
+
+/*
+  Escapa caracteres especiais antes de inserir texto dentro de JSON.
+  Isso evita quebrar o payload se uma string tiver aspas, barra invertida
+  ou quebras de linha.
+*/
 String jsonEscape(const String &value)
 {
   String escaped;
@@ -41,6 +61,11 @@ String jsonEscape(const String &value)
   return escaped;
 }
 
+/*
+  Retorna o horario atual em Unix epoch.
+  Se o ESP32 ainda nao sincronizou o relogio, retorna 0 para indicar
+  horario invalido.
+*/
 unsigned long currentEpoch()
 {
   time_t now = time(nullptr);
@@ -48,6 +73,7 @@ unsigned long currentEpoch()
   return (unsigned long)now;
 }
 
+// Converte epoch para o formato de timestamp aceito pelo Firestore.
 String isoTimestamp(unsigned long epoch)
 {
   time_t rawTime = (time_t)epoch;
@@ -59,59 +85,82 @@ String isoTimestamp(unsigned long epoch)
   return String(buffer);
 }
 
-String databaseUrl()
+// Monta a URL REST da colecao do Firestore usando os dados de secrets.h.
+String firestoreCollectionUrl()
 {
-  String url = firebaseDatabaseUrl;
-  if (url.endsWith("/")) {
-    url.remove(url.length() - 1);
-  }
+  String url = "https://firestore.googleapis.com/v1/projects/";
+  url += firestoreProjectId;
+  url += "/databases/";
+  url += firestoreDatabaseId;
+  url += "/documents/";
+  url += firestoreCollection;
+  url += "?key=";
+  url += firestoreApiKey;
 
-  url += "/readings.json?auth=";
-  url += firebaseDatabaseSecret;
   return url;
 }
 
-String buildMockReadingPayload()
+/*
+  Cria uma leitura simulada. Hoje os valores sao mockados, mas este bloco
+  pode ser trocado depois pela leitura real de sensores.
+*/
+ReadingData readMockData()
 {
-  unsigned long epoch = currentEpoch();
-  unsigned long secondsOn = random(30, 900);
-  unsigned long presenceCount = random(1, 12);
-  float energyKwh = random(1, 80) / 1000.0f;
-  float estimatedCostBrl = energyKwh * 0.92f;
+  ReadingData reading;
+  reading.epoch = currentEpoch();
+  reading.secondsOn = random(30, 900);
+  reading.presenceCount = random(1, 12);
+  reading.energyKwh = random(1, 80) / 1000.0f;
+  reading.estimatedCostBrl = reading.energyKwh * 0.92f;
 
+  return reading;
+}
+
+/*
+  Monta o JSON no formato esperado pela API REST do Firestore.
+  Cada campo precisa informar seu tipo, como stringValue, integerValue,
+  doubleValue ou booleanValue.
+*/
+String buildReadingPayload(const ReadingData &reading)
+{
   String payload;
-  payload.reserve(420);
-  payload += "{";
-  payload += "\"userId\":\"";
+  payload.reserve(620);
+  payload += "{\"fields\":{";
+  payload += "\"userId\":{\"stringValue\":\"";
   payload += jsonEscape(userId);
-  payload += "\",";
-  payload += "\"roomId\":\"";
+  payload += "\"},";
+  payload += "\"roomId\":{\"stringValue\":\"";
   payload += jsonEscape(roomId);
-  payload += "\",";
-  payload += "\"createdAt\":\"";
-  payload += isoTimestamp(epoch);
-  payload += "\",";
-  payload += "\"epoch\":";
-  payload += String(epoch);
-  payload += ",";
-  payload += "\"secondsOn\":";
-  payload += String(secondsOn);
-  payload += ",";
-  payload += "\"presenceCount\":";
-  payload += String(presenceCount);
-  payload += ",";
-  payload += "\"energyKwh\":";
-  payload += String(energyKwh, 4);
-  payload += ",";
-  payload += "\"estimatedCostBrl\":";
-  payload += String(estimatedCostBrl, 4);
-  payload += ",";
-  payload += "\"mock\":true";
-  payload += "}";
+  payload += "\"},";
+  payload += "\"createdAt\":{\"timestampValue\":\"";
+  payload += isoTimestamp(reading.epoch);
+  payload += "\"},";
+  payload += "\"epoch\":{\"integerValue\":\"";
+  payload += String(reading.epoch);
+  payload += "\"},";
+  payload += "\"secondsOn\":{\"integerValue\":\"";
+  payload += String(reading.secondsOn);
+  payload += "\"},";
+  payload += "\"presenceCount\":{\"integerValue\":\"";
+  payload += String(reading.presenceCount);
+  payload += "\"},";
+  payload += "\"energyKwh\":{\"doubleValue\":";
+  payload += String(reading.energyKwh, 4);
+  payload += "},";
+  payload += "\"estimatedCostBrl\":{\"doubleValue\":";
+  payload += String(reading.estimatedCostBrl, 4);
+  payload += "},";
+  payload += "\"mock\":{\"booleanValue\":true}";
+  payload += "}}";
 
   return payload;
 }
 
+/*
+  Conecta o ESP32 ao Wi-Fi configurado em secrets.h.
+  Retorna true quando a conexao foi feita e false quando estourou o limite
+  de tentativas.
+*/
 bool connectWiFi()
 {
   Serial.print("Conectando ao Wi-Fi: ");
@@ -137,6 +186,11 @@ bool connectWiFi()
   return true;
 }
 
+/*
+  Sincroniza o relogio interno via NTP.
+  O Firestore recebe timestamps em UTC, entao o codigo usa isoTimestamp()
+  para imprimir e enviar os valores no formato correto.
+*/
 bool syncTime()
 {
   Serial.println("Sincronizando horario por NTP...");
@@ -153,7 +207,11 @@ bool syncTime()
   return true;
 }
 
-bool sendMockReading()
+/*
+  Garante Wi-Fi e horario validos, monta o payload e envia para o
+  Firestore por HTTPS usando HTTPClient.
+*/
+bool sendReading(ReadingData reading)
 {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Wi-Fi desconectado. Tentando reconectar...");
@@ -165,22 +223,26 @@ bool sendMockReading()
     if (!syncTime()) return false;
   }
 
+  if (reading.epoch == 0) {
+    reading.epoch = currentEpoch();
+  }
+
   WiFiClientSecure client;
   client.setInsecure();
 
   HTTPClient http;
-  http.begin(client, databaseUrl());
+  http.begin(client, firestoreCollectionUrl());
   http.addHeader("Content-Type", "application/json");
 
-  String payload = buildMockReadingPayload();
-  Serial.println("Enviando leitura mockada:");
+  String payload = buildReadingPayload(reading);
+  Serial.println("Enviando leitura:");
   Serial.println(payload);
 
   int statusCode = http.POST(payload);
   String response = http.getString();
   http.end();
 
-  Serial.print("Realtime Database HTTP ");
+  Serial.print("Firestore HTTP ");
   Serial.println(statusCode);
   Serial.println(response);
 
@@ -193,6 +255,47 @@ bool sendMockReading()
   return true;
 }
 
+/*
+  Task responsavel apenas pela leitura dos dados.
+  Ela coloca cada leitura em uma fila para a task de envio processar depois.
+*/
+void readingTask(void *parameter)
+{
+  (void)parameter;
+
+  while (true) {
+    ReadingData reading = readMockData();
+
+    if (xQueueSend(readingQueue, &reading, 0) != pdTRUE) {
+      ReadingData discarded;
+      xQueueReceive(readingQueue, &discarded, 0);
+      xQueueSend(readingQueue, &reading, 0);
+      Serial.println("Fila cheia. Leitura antiga descartada.");
+    }
+
+    Serial.println("Leitura adicionada na fila.");
+    vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL_MS));
+  }
+}
+
+/*
+  Task responsavel apenas pelo envio ao Firestore.
+  Ela fica bloqueada aguardando uma leitura chegar na fila.
+*/
+void sendingTask(void *parameter)
+{
+  (void)parameter;
+
+  while (true) {
+    ReadingData reading;
+
+    if (xQueueReceive(readingQueue, &reading, portMAX_DELAY) == pdTRUE) {
+      sendReading(reading);
+    }
+  }
+}
+
+// Executa uma vez ao ligar ou resetar o ESP32.
 void setup()
 {
   Serial.begin(115200);
@@ -200,17 +303,22 @@ void setup()
 
   randomSeed((uint32_t)esp_random());
 
-  if (!connectWiFi()) return;
-  if (!syncTime()) return;
+  if (connectWiFi()) {
+    syncTime();
+  }
 
-  sendMockReading();
-  lastSendMs = millis();
+  readingQueue = xQueueCreate(READING_QUEUE_SIZE, sizeof(ReadingData));
+  if (readingQueue == nullptr) {
+    Serial.println("Falha ao criar fila de leituras.");
+    return;
+  }
+
+  xTaskCreatePinnedToCore(readingTask, "ReadingTask", 4096, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(sendingTask, "SendingTask", 8192, nullptr, 1, nullptr, 0);
 }
 
+// O trabalho principal fica nas tasks FreeRTOS.
 void loop()
 {
-  if (millis() - lastSendMs >= SEND_INTERVAL_MS) {
-    lastSendMs = millis();
-    sendMockReading();
-  }
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
