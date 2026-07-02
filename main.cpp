@@ -9,7 +9,7 @@
   Teste focado em banco de dados:
   1. conecta no Wi-Fi;
   2. sincroniza horario por NTP;
-  3. usa uma task para ler dados mockados;
+  3. usa uma task para ler o sensor no GPIO 27;
   4. usa outra task para enviar os dados ao Firestore.
 */
 
@@ -20,12 +20,17 @@ const char *roomId = "sala";
 // Intervalo entre leituras automaticas.
 const unsigned long SEND_INTERVAL_MS = 30000;
 
+// Pino D27 do ESP32. Se o sensor for ativo em LOW, troque para LOW.
+const uint8_t SENSOR_PIN = 27;
+const uint8_t SENSOR_ACTIVE_LEVEL = HIGH;
+
 const uint8_t READING_QUEUE_SIZE = 5;
 
 struct ReadingData {
   unsigned long epoch;
   unsigned long secondsOn;
   unsigned long presenceCount;
+  bool presenceDetected;
   float energyKwh;
   float estimatedCostBrl;
 };
@@ -101,16 +106,20 @@ String firestoreCollectionUrl()
 }
 
 /*
-  Cria uma leitura simulada. Hoje os valores sao mockados, mas este bloco
-  pode ser trocado depois pela leitura real de sensores.
+  Le o sinal digital do sensor no GPIO 27 e transforma essa leitura no
+  formato usado pela task de envio.
 */
-ReadingData readMockData()
+ReadingData readSensorData()
 {
+  bool presenceDetected = digitalRead(SENSOR_PIN) == SENSOR_ACTIVE_LEVEL;
+  unsigned long secondsOn = presenceDetected ? (SEND_INTERVAL_MS / 1000UL) : 0;
+
   ReadingData reading;
   reading.epoch = currentEpoch();
-  reading.secondsOn = random(30, 900);
-  reading.presenceCount = random(1, 12);
-  reading.energyKwh = random(1, 80) / 1000.0f;
+  reading.secondsOn = secondsOn;
+  reading.presenceCount = presenceDetected ? 1 : 0;
+  reading.presenceDetected = presenceDetected;
+  reading.energyKwh = secondsOn * 0.0000167f;
   reading.estimatedCostBrl = reading.energyKwh * 0.92f;
 
   return reading;
@@ -144,13 +153,16 @@ String buildReadingPayload(const ReadingData &reading)
   payload += "\"presenceCount\":{\"integerValue\":\"";
   payload += String(reading.presenceCount);
   payload += "\"},";
+  payload += "\"presenceDetected\":{\"booleanValue\":";
+  payload += reading.presenceDetected ? "true" : "false";
+  payload += "},";
   payload += "\"energyKwh\":{\"doubleValue\":";
   payload += String(reading.energyKwh, 4);
   payload += "},";
   payload += "\"estimatedCostBrl\":{\"doubleValue\":";
   payload += String(reading.estimatedCostBrl, 4);
   payload += "},";
-  payload += "\"mock\":{\"booleanValue\":true}";
+  payload += "\"mock\":{\"booleanValue\":false}";
   payload += "}}";
 
   return payload;
@@ -264,7 +276,7 @@ void readingTask(void *parameter)
   (void)parameter;
 
   while (true) {
-    ReadingData reading = readMockData();
+    ReadingData reading = readSensorData();
 
     if (xQueueSend(readingQueue, &reading, 0) != pdTRUE) {
       ReadingData discarded;
@@ -273,7 +285,8 @@ void readingTask(void *parameter)
       Serial.println("Fila cheia. Leitura antiga descartada.");
     }
 
-    Serial.println("Leitura adicionada na fila.");
+    Serial.print("Leitura adicionada na fila. Presenca: ");
+    Serial.println(reading.presenceDetected ? "sim" : "nao");
     vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL_MS));
   }
 }
@@ -301,7 +314,7 @@ void setup()
   Serial.begin(115200);
   delay(1000);
 
-  randomSeed((uint32_t)esp_random());
+  pinMode(SENSOR_PIN, INPUT);
 
   if (connectWiFi()) {
     syncTime();
