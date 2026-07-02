@@ -17,12 +17,21 @@
 const char *userId = "usuario1";
 const char *roomId = "sala";
 
-// Intervalo entre leituras automaticas.
+// Intervalo entre envios ao Firestore.
 const unsigned long SEND_INTERVAL_MS = 30000;
+
+// Intervalo de leitura do PIR. Bem curto para o LED responder quase imediato.
+const unsigned long SENSOR_POLL_INTERVAL_MS = 10;
+
+// Tempo que o LED permanece ligado depois da ultima deteccao do PIR.
+const unsigned long LED_HOLD_MS = 30000;
 
 // Pino D27 do ESP32. Se o sensor for ativo em LOW, troque para LOW.
 const uint8_t SENSOR_PIN = 27;
 const uint8_t SENSOR_ACTIVE_LEVEL = HIGH;
+
+// Pino de saida que aciona o MOSFET/LED. Este pino nao e lido.
+const uint8_t LED_OUTPUT_PIN = 26;
 
 const uint8_t READING_QUEUE_SIZE = 5;
 
@@ -106,18 +115,14 @@ String firestoreCollectionUrl()
 }
 
 /*
-  Le o sinal digital do sensor no GPIO 27 e transforma essa leitura no
-  formato usado pela task de envio.
+  Monta o resumo de leitura que sera enviado ao Firestore.
 */
-ReadingData readSensorData()
+ReadingData buildSensorReading(unsigned long secondsOn, unsigned long presenceCount, bool presenceDetected)
 {
-  bool presenceDetected = digitalRead(SENSOR_PIN) == SENSOR_ACTIVE_LEVEL;
-  unsigned long secondsOn = presenceDetected ? (SEND_INTERVAL_MS / 1000UL) : 0;
-
   ReadingData reading;
   reading.epoch = currentEpoch();
   reading.secondsOn = secondsOn;
-  reading.presenceCount = presenceDetected ? 1 : 0;
+  reading.presenceCount = presenceCount;
   reading.presenceDetected = presenceDetected;
   reading.energyKwh = secondsOn * 0.0000167f;
   reading.estimatedCostBrl = reading.energyKwh * 0.92f;
@@ -269,14 +274,49 @@ bool sendReading(ReadingData reading)
 
 /*
   Task responsavel apenas pela leitura dos dados.
-  Ela coloca cada leitura em uma fila para a task de envio processar depois.
+  Ela le o PIR com intervalo curto, aciona o LED pelo GPIO 26 quase em
+  tempo real e coloca um resumo na fila para a task de envio a cada
+  SEND_INTERVAL_MS.
 */
 void readingTask(void *parameter)
 {
   (void)parameter;
 
+  unsigned long intervalStartMs = millis();
+  unsigned long lastMotionMs = 0;
+  unsigned long presenceMs = 0;
+  unsigned long presenceCount = 0;
+  bool hasDetectedMotion = false;
+  bool lastPresenceDetected = false;
+
   while (true) {
-    ReadingData reading = readSensorData();
+    unsigned long nowMs = millis();
+    bool pirDetectedMotion = digitalRead(SENSOR_PIN) == SENSOR_ACTIVE_LEVEL;
+
+    if (pirDetectedMotion) {
+      lastMotionMs = nowMs;
+      hasDetectedMotion = true;
+    }
+
+    bool presenceDetected = hasDetectedMotion && (nowMs - lastMotionMs <= LED_HOLD_MS);
+    digitalWrite(LED_OUTPUT_PIN, presenceDetected ? HIGH : LOW);
+
+    if (presenceDetected) {
+      presenceMs += SENSOR_POLL_INTERVAL_MS;
+    }
+
+    if (pirDetectedMotion && !lastPresenceDetected) {
+      presenceCount++;
+    }
+
+    lastPresenceDetected = pirDetectedMotion;
+
+    if (nowMs - intervalStartMs < SEND_INTERVAL_MS) {
+      vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_INTERVAL_MS));
+      continue;
+    }
+
+    ReadingData reading = buildSensorReading(presenceMs / 1000UL, presenceCount, presenceDetected);
 
     if (xQueueSend(readingQueue, &reading, 0) != pdTRUE) {
       ReadingData discarded;
@@ -287,7 +327,11 @@ void readingTask(void *parameter)
 
     Serial.print("Leitura adicionada na fila. Presenca: ");
     Serial.println(reading.presenceDetected ? "sim" : "nao");
-    vTaskDelay(pdMS_TO_TICKS(SEND_INTERVAL_MS));
+
+    intervalStartMs = nowMs;
+    presenceMs = 0;
+    presenceCount = 0;
+    vTaskDelay(pdMS_TO_TICKS(SENSOR_POLL_INTERVAL_MS));
   }
 }
 
@@ -315,6 +359,9 @@ void setup()
   delay(1000);
 
   pinMode(SENSOR_PIN, INPUT);
+  pinMode(LED_OUTPUT_PIN, OUTPUT);
+  digitalWrite(LED_OUTPUT_PIN, LOW);
+  Serial.println("GPIO 26 configurado como saida.");
 
   if (connectWiFi()) {
     syncTime();
@@ -326,7 +373,7 @@ void setup()
     return;
   }
 
-  xTaskCreatePinnedToCore(readingTask, "ReadingTask", 4096, nullptr, 1, nullptr, 1);
+  xTaskCreatePinnedToCore(readingTask, "ReadingTask", 4096, nullptr, 3, nullptr, 1);
   xTaskCreatePinnedToCore(sendingTask, "SendingTask", 8192, nullptr, 1, nullptr, 0);
 }
 
