@@ -1,3 +1,10 @@
+//TODO:
+//anotar (no papel) o funcionamento do código
+//fazer um diagrama de blocos do funcionamento do código
+//fazer mais testes com outros comodos e usuarios
+//colocar frontend aqui no repositorio
+//publicar site
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
@@ -14,8 +21,8 @@
 */
 
 // Identificadores fixos usados nos documentos enviados para o Firestore.
-const char *userId = "usuario1";
-const char *roomId = "sala";
+const char *userId = "yL8v8v7K13n7oAIbDVTy";
+const char *roomId = "cozinha";
 
 // Intervalo entre envios ao Firestore.
 const unsigned long SEND_INTERVAL_MS = 30000;

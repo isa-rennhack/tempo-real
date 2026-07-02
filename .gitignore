@@ -4,3 +4,9 @@
 .vscode/launch.json
 .vscode/ipch
 secrets.h
+smart-lighting/software/.env
+smart-lighting/software/.env.*
+smart-lighting/software/node_modules/
+smart-lighting/software/.output/
+smart-lighting/software/.tanstack/
+smart-lighting/software/.wrangler/
